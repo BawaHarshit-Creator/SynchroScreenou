@@ -1,9 +1,11 @@
 package com.example.synchroscreenou.network.client
 
 import android.content.Context
+import android.os.SystemClock
 import android.util.Log
 import java.io.BufferedInputStream
 import java.io.DataInputStream
+import java.io.DataOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -13,6 +15,10 @@ import java.net.Socket
 class TcpClient {
 
     private var socket: Socket? = null
+
+    @Volatile
+    var clockOffsetNanos: Long = 0L
+        private set
 
     @Volatile
     private var isListening = false
@@ -62,6 +68,38 @@ class TcpClient {
                 val input = DataInputStream(
                     BufferedInputStream(clientSocket.getInputStream())
                 )
+
+                // Send clock synchronization requests every second.
+                Thread {
+                    try {
+                        val output = DataOutputStream(
+                            clientSocket.getOutputStream()
+                        )
+
+                        while (isListening && !clientSocket.isClosed) {
+
+                            val clientSendTime =
+                                SystemClock.elapsedRealtimeNanos()
+
+                            synchronized(clientSocket) {
+                                output.writeUTF("SYNC_REQUEST")
+                                output.writeLong(clientSendTime)
+                                output.flush()
+                            }
+
+                            Thread.sleep(1000)
+                        }
+
+                    } catch (e: Exception) {
+                        if (isListening) {
+                            Log.e(
+                                "TcpClient",
+                                "Clock sync request failed",
+                                e
+                            )
+                        }
+                    }
+                }.start()
 
                 while (isListening && !clientSocket.isClosed) {
 
@@ -122,7 +160,7 @@ class TcpClient {
 
                             Log.d(
                                 "TcpClient",
-                                "Video received: ${videoFile.absolutePath}"
+                                "Video received successfully: ${videoFile.absolutePath}, size: ${videoFile.length()} bytes (expected: $fileSize bytes)"
                             )
 
                             onVideoReceived(videoFile, null)
@@ -147,6 +185,27 @@ class TcpClient {
                             )
 
                             onPlaybackCommand("SEEK", position)
+                        }
+
+                        "SYNC_RESPONSE" -> {
+
+                            val clientSendTime = input.readLong()
+                            val hostReceiveTime = input.readLong()
+                            val hostSendTime = input.readLong()
+
+                            val clientReceiveTime =
+                                SystemClock.elapsedRealtimeNanos()
+
+                            // Calculate the estimated clock difference.
+                            clockOffsetNanos = (
+                                    (hostReceiveTime - clientSendTime) +
+                                            (hostSendTime - clientReceiveTime)
+                                    ) / 2
+
+                            Log.d(
+                                "TcpClient",
+                                "Clock offset: ${clockOffsetNanos / 1_000_000} ms"
+                            )
                         }
 
                         else -> {

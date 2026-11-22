@@ -89,13 +89,9 @@ class TcpServer {
                     "SYNC_REQUEST" -> {
 
                         // Time when host receives the request
+                        val clientSendTime = input.readLong()
                         val hostReceiveTime =
                             SystemClock.elapsedRealtimeNanos()
-
-                        // Read client's sending timestamp
-                        val clientSendTime = input.readLong()
-
-                        // Time when host sends the response
                         val hostSendTime =
                             SystemClock.elapsedRealtimeNanos()
 
