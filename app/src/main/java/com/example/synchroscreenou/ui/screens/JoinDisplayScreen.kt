@@ -19,6 +19,7 @@ import com.example.synchroscreenou.network.discovery.NetworkDiscoveryManager
 import com.example.synchroscreenou.network.client.TcpClient
 import java.io.File
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.common.Player
 @Composable
 fun JoinDisplayScreen(
     modifier: Modifier = Modifier,
@@ -46,6 +47,9 @@ fun JoinDisplayScreen(
     }
     var exoPlayer by remember {
         mutableStateOf<ExoPlayer?>(null)
+    }
+    val pendingPlaybackCommands = remember {
+        mutableStateListOf<Pair<String, Long?>>()
     }
     val discoveredDisplays = remember {
         mutableStateListOf<DiscoveredDisplay>()
@@ -188,7 +192,8 @@ fun JoinDisplayScreen(
 
                                                                     if (file != null) {
                                                                         receivedVideoFile = file
-                                                                        receivingStatus = "Video received successfully!"
+                                                                        exoPlayer = null
+                                                                         receivingStatus = "Video received successfully!"
                                                                     } else {
                                                                         receivingStatus = "Receiving failed: $receiveError"
                                                                     }
@@ -199,17 +204,14 @@ fun JoinDisplayScreen(
 
                                                                 mainHandler.post {
 
-                                                                    when (command) {
-
-                                                                        "PLAY" -> exoPlayer?.play()
-
-                                                                        "PAUSE" -> exoPlayer?.pause()
-
-                                                                        "SEEK" -> {
-                                                                            position?.let {
-                                                                                exoPlayer?.seekTo(it)
-                                                                            }
-                                                                        }
+                                                                    val readyPlayer = exoPlayer
+                                                                    if (
+                                                                        readyPlayer != null &&
+                                                                        readyPlayer.playbackState == Player.STATE_READY
+                                                                    ) {
+                                                                        applyPlaybackCommand(readyPlayer, command, position)
+                                                                    } else {
+                                                                        pendingPlaybackCommands.add(command to position)
                                                                     }
                                                                 }
                                                             }
@@ -303,6 +305,10 @@ fun JoinDisplayScreen(
                 videoFile = videoFile,
                 onPlayerReady = { player ->
                     exoPlayer = player
+                    pendingPlaybackCommands.toList().forEach { (command, position) ->
+                        applyPlaybackCommand(player, command, position)
+                    }
+                    pendingPlaybackCommands.clear()
                 }
             )
         }
@@ -318,5 +324,17 @@ fun JoinDisplayScreen(
         ) {
             Text("Back")
         }
+    }
+}
+
+private fun applyPlaybackCommand(
+    player: ExoPlayer,
+    command: String,
+    position: Long?
+) {
+    when (command) {
+        "PLAY" -> player.play()
+        "PAUSE" -> player.pause()
+        "SEEK" -> player.seekTo(position ?: 0L)
     }
 }

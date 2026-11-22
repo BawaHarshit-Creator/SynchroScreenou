@@ -8,6 +8,8 @@ import android.os.Looper
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -57,6 +59,9 @@ fun CreateDisplayScreen(
 
             selectedVideoUri = uri
             isVideoSent = false
+            hostVideoFile = null
+            hostPlayer = null
+            videoDuration = 0L
             transferStatus = ""
             seekPosition = 0f
         }
@@ -102,6 +107,17 @@ fun CreateDisplayScreen(
         }
     }
 
+    // Track video playback position for the slider
+    LaunchedEffect(hostPlayer) {
+        val player = hostPlayer ?: return@LaunchedEffect
+        while (true) {
+            if (player.isPlaying) {
+                seekPosition = player.currentPosition.toFloat().coerceIn(0f, videoDuration.toFloat())
+            }
+            kotlinx.coroutines.delay(500L)
+        }
+    }
+
     fun stopDisplay() {
         tcpServer.stop()
         discoveryManager.stopAdvertising()
@@ -120,6 +136,7 @@ fun CreateDisplayScreen(
     Column(
         modifier = modifier
             .fillMaxSize()
+            .verticalScroll(rememberScrollState())
             .padding(24.dp),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally
@@ -178,6 +195,8 @@ fun CreateDisplayScreen(
                 Button(
                     onClick = {
                         val uri = selectedVideoUri ?: return@Button
+                        isVideoSent = false
+                        transferStatus = "Preparing video..."
 
                         Thread {
                             try {
@@ -192,9 +211,11 @@ fun CreateDisplayScreen(
                                         videoFile.outputStream().use { output ->
                                             input.copyTo(output)
                                         }
-                                    } ?: throw Exception(
-                                    "Cannot open selected video"
-                                )
+                                    } ?: throw Exception("Cannot open selected video")
+
+                                if (!videoFile.exists() || videoFile.length() <= 0L) {
+                                    throw Exception("Selected video copy is empty")
+                                }
                                 mainHandler.post {
                                     hostVideoFile = videoFile
                                 }
@@ -205,7 +226,7 @@ fun CreateDisplayScreen(
                                                 isVideoSent = true
                                                 "Video sent to $address"
                                             } else {
-                                                "Transfer failed for $address"
+                                                "Transfer failed for $address".also { isVideoSent = false }
                                             }
                                     }
                                 }
@@ -250,7 +271,7 @@ fun CreateDisplayScreen(
                             hostPlayer?.play()
                             tcpServer.sendPlaybackCommand("PLAY")
                         },
-                        enabled = isVideoSent && connectedDevices > 0,
+                        enabled = isVideoSent && hostPlayer != null && connectedDevices > 0,
                         modifier = Modifier.weight(1f)
                     ) {
                         Text("Play All")
@@ -261,7 +282,7 @@ fun CreateDisplayScreen(
                             hostPlayer?.pause()
                             tcpServer.sendPlaybackCommand("PAUSE")
                         },
-                        enabled = isVideoSent && connectedDevices > 0,
+                        enabled = isVideoSent && hostPlayer != null && connectedDevices > 0,
                         modifier = Modifier.weight(1f)
                     ) {
                         Text("Pause All")

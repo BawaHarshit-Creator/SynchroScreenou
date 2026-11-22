@@ -22,31 +22,39 @@ fun VideoPlayer(
     onPlayerReady: (ExoPlayer) -> Unit = {}
 ) {
     val context = LocalContext.current
+    val latestOnPlayerReady by rememberUpdatedState(onPlayerReady)
+    val latestVideoFile by rememberUpdatedState(videoFile)
 
+    // The host's Play All command controls playback. Preparing a player must
+    // not start it early and introduce timing differences between devices.
     val player = remember {
         ExoPlayer.Builder(context).build().apply {
             playWhenReady = false
+            repeatMode = Player.REPEAT_MODE_ONE
         }
     }
 
-    DisposableEffect(player) {
+    val exoPlayer = player
 
-        var readyReported = false
+    DisposableEffect(player) {
+        var reportedReadyFor: File? = null
 
         val listener = object : Player.Listener {
-
             override fun onPlaybackStateChanged(playbackState: Int) {
-                if (playbackState == Player.STATE_READY && !readyReported) {
-                    readyReported = true
-                    Log.d("VideoPlayer", "Video is ready for playback")
-                    onPlayerReady(player)
+                if (
+                    playbackState == Player.STATE_READY &&
+                    reportedReadyFor != latestVideoFile
+                ) {
+                    reportedReadyFor = latestVideoFile
+                    Log.d("VideoPlayer", "Video ready: ${latestVideoFile.name}")
+                    latestOnPlayerReady(player)
                 }
             }
 
             override fun onPlayerError(error: PlaybackException) {
                 Log.e(
                     "VideoPlayer",
-                    "Playback error: ${error.errorCodeName}, message: ${error.message}",
+                    "Playback error: ${error.errorCodeName}; ${error.message}",
                     error
                 )
             }
@@ -63,27 +71,31 @@ fun VideoPlayer(
     LaunchedEffect(videoFile) {
         Log.d(
             "VideoPlayer",
-            "Loading video: ${videoFile.absolutePath}, exists: ${videoFile.exists()}, size: ${videoFile.length()}"
+            "Loading ${videoFile.absolutePath}; exists=${videoFile.exists()}; " +
+                "isFile=${videoFile.isFile}; size=${videoFile.length()}"
         )
 
-        if (videoFile.exists() && videoFile.length() > 0L) {
-            val mediaItem = MediaItem.fromUri(Uri.fromFile(videoFile))
-            player.setMediaItem(mediaItem)
-            player.prepare()
-        } else {
-            Log.e("VideoPlayer", "Video file does not exist or is empty")
+        player.pause()
+        player.playWhenReady = false
+
+        if (!videoFile.exists() || !videoFile.isFile || videoFile.length() <= 0L) {
+            Log.e("VideoPlayer", "Cannot play: video file is missing or empty")
+            return@LaunchedEffect
         }
+
+        player.setMediaItem(MediaItem.fromUri(Uri.fromFile(videoFile)))
+        player.prepare()
     }
 
     AndroidView(
-        factory = {
-            PlayerView(it).apply {
-                this.player = player
+        factory = { viewContext ->
+            PlayerView(viewContext).apply {
+                this.player = exoPlayer
                 useController = true
             }
         },
-        update = {
-            it.player = player
+        update = { playerView ->
+            playerView.player = exoPlayer
         },
         modifier = Modifier
             .fillMaxWidth()

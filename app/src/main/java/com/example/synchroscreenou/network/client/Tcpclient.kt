@@ -1,11 +1,9 @@
 package com.example.synchroscreenou.network.client
 
 import android.content.Context
-import android.os.SystemClock
 import android.util.Log
 import java.io.BufferedInputStream
 import java.io.DataInputStream
-import java.io.DataOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -14,11 +12,8 @@ import java.net.Socket
 
 class TcpClient {
 
-    private var socket: Socket? = null
-
     @Volatile
-    var clockOffsetNanos: Long = 0L
-        private set
+    private var socket: Socket? = null
 
     @Volatile
     private var isListening = false
@@ -31,18 +26,12 @@ class TcpClient {
         Thread {
             try {
                 val clientSocket = Socket()
-
-                clientSocket.connect(
-                    InetSocketAddress(ipAddress, port),
-                    5000
-                )
-
+                clientSocket.tcpNoDelay = true
+                clientSocket.connect(InetSocketAddress(ipAddress, port), 5000)
                 socket = clientSocket
 
                 Log.d("TcpClient", "Connected to $ipAddress:$port")
-
                 onResult(true, null)
-
             } catch (e: IOException) {
                 Log.e("TcpClient", "Connection failed", e)
                 onResult(false, e.message)
@@ -50,195 +39,120 @@ class TcpClient {
         }.start()
     }
 
-    // Continuously listen for messages from the host.
     fun startListening(
         context: Context,
         onVideoReceived: (File?, String?) -> Unit,
         onPlaybackCommand: (String, Long?) -> Unit
     ) {
+        val clientSocket = socket
+        if (clientSocket == null || !clientSocket.isConnected || clientSocket.isClosed) {
+            onVideoReceived(null, "Not connected to host")
+            return
+        }
         if (isListening) return
-
         isListening = true
 
         Thread {
             try {
-                val clientSocket = socket
-                    ?: throw IOException("Not connected to host")
-
                 val input = DataInputStream(
                     BufferedInputStream(clientSocket.getInputStream())
                 )
 
-                // Send clock synchronization requests every second.
-                Thread {
-                    try {
-                        val output = DataOutputStream(
-                            clientSocket.getOutputStream()
-                        )
-
-                        while (isListening && !clientSocket.isClosed) {
-
-                            val clientSendTime =
-                                SystemClock.elapsedRealtimeNanos()
-
-                            synchronized(clientSocket) {
-                                output.writeUTF("SYNC_REQUEST")
-                                output.writeLong(clientSendTime)
-                                output.flush()
-                            }
-
-                            Thread.sleep(1000)
-                        }
-
-                    } catch (e: Exception) {
-                        if (isListening) {
-                            Log.e(
-                                "TcpClient",
-                                "Clock sync request failed",
-                                e
-                            )
-                        }
-                    }
-                }.start()
-
                 while (isListening && !clientSocket.isClosed) {
-
-                    // Read incoming message type.
-                    val messageType = input.readUTF()
-
-                    when (messageType) {
-
+                    when (val messageType = input.readUTF()) {
                         "VIDEO" -> {
-
                             val fileSize = input.readLong()
                             val fileName = input.readUTF()
 
                             if (fileSize <= 0L) {
-                                throw IOException("Invalid video file size")
+                                throw IOException("Invalid video file size: $fileSize")
                             }
-
                             if (fileSize > context.cacheDir.usableSpace) {
-                                throw IOException("Not enough storage space")
+                                throw IOException("Not enough storage space for video")
                             }
 
                             val safeName = File(fileName).name
+                            val uniqueName = "received_${System.currentTimeMillis()}_$safeName"
+                            val finalFile = File(context.cacheDir, uniqueName)
+                            val temporaryFile = File(context.cacheDir, "$uniqueName.part")
 
-                            val videoFile = File(
-                                context.cacheDir,
-                                "received_$safeName"
-                            )
+                            try {
+                                FileOutputStream(temporaryFile).use { output ->
+                                    val buffer = ByteArray(64 * 1024)
+                                    var remaining = fileSize
 
-                            FileOutputStream(videoFile).use { output ->
+                                    while (remaining > 0L) {
+                                        val requested = minOf(buffer.size.toLong(), remaining).toInt()
+                                        val bytesRead = input.read(buffer, 0, requested)
+                                        if (bytesRead < 0) {
+                                            throw IOException("Video transfer interrupted; $remaining bytes missing")
+                                        }
+                                        if (bytesRead == 0) continue
 
-                                val buffer = ByteArray(64 * 1024)
-                                var remaining = fileSize
-
-                                while (remaining > 0) {
-
-                                    val bytesToRead = minOf(
-                                        buffer.size.toLong(),
-                                        remaining
-                                    ).toInt()
-
-                                    val bytesRead = input.read(
-                                        buffer,
-                                        0,
-                                        bytesToRead
-                                    )
-
-                                    if (bytesRead == -1) {
-                                        throw IOException(
-                                            "Video transfer interrupted"
-                                        )
+                                        output.write(buffer, 0, bytesRead)
+                                        remaining -= bytesRead
                                     }
-
-                                    output.write(buffer, 0, bytesRead)
-
-                                    remaining -= bytesRead
+                                    output.fd.sync()
+                                    output.flush()
                                 }
+
+                                if (temporaryFile.length() != fileSize) {
+                                    throw IOException(
+                                        "Incomplete video: received ${temporaryFile.length()} of $fileSize bytes"
+                                    )
+                                }
+
+                                if (finalFile.exists() && !finalFile.delete()) {
+                                    throw IOException("Could not replace previous received video")
+                                }
+                                if (!temporaryFile.renameTo(finalFile)) {
+                                    throw IOException("Could not finalize received video file")
+                                }
+
+                                Log.d(
+                                    "TcpClient",
+                                    "Video received: ${finalFile.absolutePath}, ${finalFile.length()} bytes"
+                                )
+                                onVideoReceived(finalFile, null)
+                            } catch (e: Exception) {
+                                temporaryFile.delete()
+                                throw e
                             }
-
-                            Log.d(
-                                "TcpClient",
-                                "Video received successfully: ${videoFile.absolutePath}, size: ${videoFile.length()} bytes (expected: $fileSize bytes)"
-                            )
-
-                            onVideoReceived(videoFile, null)
                         }
 
-                        "PLAY" -> {
-                            Log.d("TcpClient", "PLAY command received")
-                            onPlaybackCommand("PLAY", null)
-                        }
-
-                        "PAUSE" -> {
-                            Log.d("TcpClient", "PAUSE command received")
-                            onPlaybackCommand("PAUSE", null)
-                        }
-
+                        "PLAY" -> onPlaybackCommand("PLAY", null)
+                        "PAUSE" -> onPlaybackCommand("PAUSE", null)
                         "SEEK" -> {
                             val position = input.readLong()
-
-                            Log.d(
-                                "TcpClient",
-                                "SEEK command received: $position"
-                            )
-
                             onPlaybackCommand("SEEK", position)
                         }
 
-                        "SYNC_RESPONSE" -> {
-
-                            val clientSendTime = input.readLong()
-                            val hostReceiveTime = input.readLong()
-                            val hostSendTime = input.readLong()
-
-                            val clientReceiveTime =
-                                SystemClock.elapsedRealtimeNanos()
-
-                            // Calculate the estimated clock difference.
-                            clockOffsetNanos = (
-                                    (hostReceiveTime - clientSendTime) +
-                                            (hostSendTime - clientReceiveTime)
-                                    ) / 2
-
-                            Log.d(
-                                "TcpClient",
-                                "Clock offset: ${clockOffsetNanos / 1_000_000} ms"
-                            )
-                        }
-
                         else -> {
-                            Log.e(
-                                "TcpClient",
-                                "Unknown message: $messageType"
-                            )
+                            Log.e("TcpClient", "Unknown host message: $messageType")
+                            throw IOException("Unsupported host message: $messageType")
                         }
                     }
                 }
-
             } catch (e: Exception) {
                 if (isListening) {
-                    Log.e("TcpClient", "Listening error", e)
+                    Log.e("TcpClient", "Listening stopped", e)
+                    onVideoReceived(null, e.message ?: "Connection error")
                 }
             } finally {
                 isListening = false
             }
-
         }.start()
     }
 
     fun disconnect() {
         isListening = false
-
         try {
             socket?.close()
-            socket = null
-
-            Log.d("TcpClient", "Disconnected")
-
         } catch (e: IOException) {
             Log.e("TcpClient", "Disconnect error", e)
+        } finally {
+            socket = null
+            Log.d("TcpClient", "Disconnected")
         }
     }
 }

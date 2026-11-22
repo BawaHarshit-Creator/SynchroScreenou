@@ -1,7 +1,9 @@
 package com.example.synchroscreenou.network.server
 
 import android.util.Log
+import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
+import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.File
 import java.io.FileInputStream
@@ -9,9 +11,7 @@ import java.io.IOException
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
-import android.os.SystemClock
-import java.io.DataInputStream
-import java.io.BufferedInputStream
+
 class TcpServer {
 
     @Volatile
@@ -20,34 +20,37 @@ class TcpServer {
     @Volatile
     private var isRunning = false
 
-    private val connectedClients = mutableSetOf<Socket>()
+    // Each connected client has exactly one output stream. All writes to that
+    // stream synchronize on the stream itself to prevent packet interleaving.
+    private val clientStreams = mutableMapOf<Socket, DataOutputStream>()
 
     fun start(
         onServerStarted: (Int) -> Unit,
         onClientCountChanged: (Int) -> Unit
     ) {
         if (isRunning) return
-
         isRunning = true
 
         Thread {
             try {
                 val server = ServerSocket(0)
                 serverSocket = server
-
                 Log.d("TcpServer", "Server started on port: ${server.localPort}")
-
                 onServerStarted(server.localPort)
 
                 while (isRunning) {
                     val client = server.accept()
+                    client.tcpNoDelay = true
 
-                    val clientCount = synchronized(connectedClients) {
-                        connectedClients.add(client)
-                        connectedClients.size
+                    val output = DataOutputStream(
+                        BufferedOutputStream(client.getOutputStream())
+                    )
+
+                    val count = synchronized(clientStreams) {
+                        clientStreams[client] = output
+                        clientStreams.size
                     }
-
-                    onClientCountChanged(clientCount)
+                    onClientCountChanged(count)
 
                     Log.d(
                         "TcpServer",
@@ -58,13 +61,10 @@ class TcpServer {
                         handleClient(client, onClientCountChanged)
                     }.start()
                 }
-
             } catch (e: SocketException) {
-                if (isRunning) {
-                    Log.e("TcpServer", "Socket error", e)
-                }
+                if (isRunning) Log.e("TcpServer", "Socket error", e)
             } catch (e: IOException) {
-                Log.e("TcpServer", "Server error", e)
+                if (isRunning) Log.e("TcpServer", "Server error", e)
             } finally {
                 isRunning = false
             }
@@ -81,151 +81,83 @@ class TcpServer {
             )
 
             while (isRunning && !client.isClosed) {
-
                 val messageType = input.readUTF()
-
-                when (messageType) {
-
-                    "SYNC_REQUEST" -> {
-
-                        // Time when host receives the request
-                        val clientSendTime = input.readLong()
-                        val hostReceiveTime =
-                            SystemClock.elapsedRealtimeNanos()
-                        val hostSendTime =
-                            SystemClock.elapsedRealtimeNanos()
-
-                        synchronized(client) {
-
-                            val output = DataOutputStream(
-                                client.getOutputStream()
-                            )
-
-                            output.writeUTF("SYNC_RESPONSE")
-                            output.writeLong(clientSendTime)
-                            output.writeLong(hostReceiveTime)
-                            output.writeLong(hostSendTime)
-                            output.flush()
-
-                        }
-
-                        Log.d("TcpServer", "Clock sync response sent")
-                    }
-                }
+                Log.w("TcpServer", "Unexpected message from client: $messageType")
             }
-
         } catch (e: IOException) {
-            Log.d("TcpServer", "Client disconnected")
+            if (isRunning) Log.d("TcpServer", "Client disconnected: ${e.message}")
         } finally {
-
-            val clientCount = synchronized(connectedClients) {
-                connectedClients.remove(client)
-                connectedClients.size
+            val count = synchronized(clientStreams) {
+                clientStreams.remove(client)
+                clientStreams.size
             }
-
-            onClientCountChanged(clientCount)
+            onClientCountChanged(count)
 
             try {
                 client.close()
             } catch (_: IOException) {
             }
-
             Log.d("TcpServer", "Client connection closed")
         }
     }
 
-    // Send a video to all connected phones.
     fun sendVideo(
         videoFile: File,
         onResult: (String, Boolean) -> Unit
     ) {
-        if (!videoFile.exists() || !videoFile.isFile) {
-            Log.e("TcpServer", "Video file does not exist")
+        if (!videoFile.exists() || !videoFile.isFile || videoFile.length() <= 0L) {
+            Log.e("TcpServer", "Video file is missing or empty: ${videoFile.absolutePath}")
             return
         }
 
-        val clients = synchronized(connectedClients) {
-            connectedClients.toList()
+        val entries = synchronized(clientStreams) {
+            clientStreams.entries.toList()
         }
 
-        if (clients.isEmpty()) {
+        if (entries.isEmpty()) {
             Log.d("TcpServer", "No connected phones")
             return
         }
 
-        clients.forEach { client ->
-
+        entries.forEach { (client, output) ->
             Thread {
-                val clientAddress =
-                    client.inetAddress.hostAddress ?: "Unknown"
-
+                val address = client.inetAddress.hostAddress ?: "Unknown"
                 try {
-                    synchronized(client) {
-
-                        val output = DataOutputStream(
-                            BufferedOutputStream(client.getOutputStream())
-                        )
-
-                        // Message type
+                    synchronized(output) {
                         output.writeUTF("VIDEO")
-
-                        // Video information
                         output.writeLong(videoFile.length())
                         output.writeUTF(videoFile.name)
 
-                        // Send video in chunks
                         FileInputStream(videoFile).use { input ->
-
                             val buffer = ByteArray(64 * 1024)
-
                             while (true) {
-                                val bytesRead = input.read(buffer)
-
-                                if (bytesRead == -1) break
-
-                                output.write(buffer, 0, bytesRead)
+                                val count = input.read(buffer)
+                                if (count < 0) break
+                                output.write(buffer, 0, count)
                             }
                         }
-
                         output.flush()
                     }
 
-                    Log.d(
-                        "TcpServer",
-                        "Video sent successfully to $clientAddress"
-                    )
-
-                    onResult(clientAddress, true)
-
+                    Log.d("TcpServer", "Video sent to $address")
+                    onResult(address, true)
                 } catch (e: IOException) {
-
-                    Log.e(
-                        "TcpServer",
-                        "Video transfer failed for $clientAddress",
-                        e
-                    )
-
-                    onResult(clientAddress, false)
+                    Log.e("TcpServer", "Video transfer failed for $address", e)
+                    onResult(address, false)
                 }
-
             }.start()
         }
     }
 
-    // Send PLAY or PAUSE to all connected phones.
     fun sendPlaybackCommand(command: String) {
-
         if (command != "PLAY" && command != "PAUSE") {
             Log.e("TcpServer", "Invalid playback command: $command")
             return
         }
-
         sendCommandToClients(command)
     }
 
-    // Send a SEEK command with a timestamp in milliseconds.
     fun sendSeekCommand(position: Long) {
-
         sendCommandToClients("SEEK", position)
     }
 
@@ -233,35 +165,22 @@ class TcpServer {
         command: String,
         position: Long? = null
     ) {
-
-        val clients = synchronized(connectedClients) {
-            connectedClients.toList()
+        val entries = synchronized(clientStreams) {
+            clientStreams.entries.toList()
         }
 
-        clients.forEach { client ->
-
+        entries.forEach { (client, output) ->
             Thread {
                 try {
-                    synchronized(client) {
-
-                        val output = DataOutputStream(
-                            client.getOutputStream()
-                        )
-
+                    synchronized(output) {
                         output.writeUTF(command)
-
-                        if (command == "SEEK") {
-                            output.writeLong(position ?: 0L)
-                        }
-
+                        if (command == "SEEK") output.writeLong(position ?: 0L)
                         output.flush()
                     }
-
                     Log.d(
                         "TcpServer",
                         "$command sent to ${client.inetAddress.hostAddress}"
                     )
-
                 } catch (e: IOException) {
                     Log.e("TcpServer", "Command sending failed", e)
                 }
@@ -270,7 +189,6 @@ class TcpServer {
     }
 
     fun stop() {
-
         isRunning = false
 
         try {
@@ -278,19 +196,21 @@ class TcpServer {
         } catch (_: IOException) {
         }
 
-        synchronized(connectedClients) {
-            connectedClients.forEach {
+        synchronized(clientStreams) {
+            clientStreams.forEach { (client, output) ->
                 try {
-                    it.close()
+                    output.close()
+                } catch (_: IOException) {
+                }
+                try {
+                    client.close()
                 } catch (_: IOException) {
                 }
             }
-
-            connectedClients.clear()
+            clientStreams.clear()
         }
 
         serverSocket = null
-
         Log.d("TcpServer", "Server stopped")
     }
 }
