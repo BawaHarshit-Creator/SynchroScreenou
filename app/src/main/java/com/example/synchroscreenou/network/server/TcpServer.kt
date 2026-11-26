@@ -20,9 +20,19 @@ class TcpServer {
     @Volatile
     private var isRunning = false
 
-    // Each connected client has exactly one output stream. All writes to that
-    // stream synchronize on the stream itself to prevent packet interleaving.
     private val clientStreams = mutableMapOf<Socket, DataOutputStream>()
+    private val clientTiles = mutableMapOf<Socket, Int>()
+    private val assignedTiles = mutableSetOf<Int>()
+
+    private fun allocateTile(): Int {
+        for (i in 0..3) {
+            if (!assignedTiles.contains(i)) {
+                assignedTiles.add(i)
+                return i
+            }
+        }
+        return 0
+    }
 
     fun start(
         onServerStarted: (Int) -> Unit,
@@ -47,6 +57,8 @@ class TcpServer {
                     )
 
                     val count = synchronized(clientStreams) {
+                        val tile = allocateTile()
+                        clientTiles[client] = tile
                         clientStreams[client] = output
                         clientStreams.size
                     }
@@ -88,6 +100,8 @@ class TcpServer {
             if (isRunning) Log.d("TcpServer", "Client disconnected: ${e.message}")
         } finally {
             val count = synchronized(clientStreams) {
+                clientTiles[client]?.let { assignedTiles.remove(it) }
+                clientTiles.remove(client)
                 clientStreams.remove(client)
                 clientStreams.size
             }
@@ -122,9 +136,11 @@ class TcpServer {
         entries.forEach { (client, output) ->
             Thread {
                 val address = client.inetAddress.hostAddress ?: "Unknown"
+                val tileIndex = synchronized(clientStreams) { clientTiles[client] ?: 0 }
                 try {
                     synchronized(output) {
                         output.writeUTF("VIDEO")
+                        output.writeInt(tileIndex)
                         output.writeLong(videoFile.length())
                         output.writeUTF(videoFile.name)
 
@@ -139,7 +155,7 @@ class TcpServer {
                         output.flush()
                     }
 
-                    Log.d("TcpServer", "Video sent to $address")
+                    Log.d("TcpServer", "Video sent to $address (Tile $tileIndex)")
                     onResult(address, true)
                 } catch (e: IOException) {
                     Log.e("TcpServer", "Video transfer failed for $address", e)
@@ -208,6 +224,8 @@ class TcpServer {
                 }
             }
             clientStreams.clear()
+            clientTiles.clear()
+            assignedTiles.clear()
         }
 
         serverSocket = null

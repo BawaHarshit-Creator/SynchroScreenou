@@ -41,12 +41,12 @@ class TcpClient {
 
     fun startListening(
         context: Context,
-        onVideoReceived: (File?, String?) -> Unit,
+        onVideoReceived: (File?, Int, String?) -> Unit,
         onPlaybackCommand: (String, Long?) -> Unit
     ) {
         val clientSocket = socket
         if (clientSocket == null || !clientSocket.isConnected || clientSocket.isClosed) {
-            onVideoReceived(null, "Not connected to host")
+            onVideoReceived(null, 0, "Not connected to host")
             return
         }
         if (isListening) return
@@ -61,6 +61,7 @@ class TcpClient {
                 while (isListening && !clientSocket.isClosed) {
                     when (val messageType = input.readUTF()) {
                         "VIDEO" -> {
+                            val tileIndex = input.readInt()
                             val fileSize = input.readLong()
                             val fileName = input.readUTF()
 
@@ -111,9 +112,9 @@ class TcpClient {
 
                                 Log.d(
                                     "TcpClient",
-                                    "Video received: ${finalFile.absolutePath}, ${finalFile.length()} bytes"
+                                    "Video received: ${finalFile.absolutePath}, Tile $tileIndex, ${finalFile.length()} bytes"
                                 )
-                                onVideoReceived(finalFile, null)
+                                onVideoReceived(finalFile, tileIndex, null)
                             } catch (e: Exception) {
                                 temporaryFile.delete()
                                 throw e
@@ -136,7 +137,7 @@ class TcpClient {
             } catch (e: Exception) {
                 if (isListening) {
                     Log.e("TcpClient", "Listening stopped", e)
-                    onVideoReceived(null, e.message ?: "Connection error")
+                    onVideoReceived(null, 0, e.message ?: "Connection error")
                 }
             } finally {
                 isListening = false
